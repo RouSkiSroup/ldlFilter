@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lidl Product Filter
 // @namespace    http://tampermonkey.net/
-// @version      1.1.0
+// @version      1.2.0
 // @description  Filtrování produktů na Lidl.cz podle textu, slevy a přítomnosti akumulátoru (bez baterie / se sadou), efektivní dávkové přednačítání a řazení
 // @author       Filip J. & Tomi
 // @match        https://www.lidl.cz/*
@@ -15,7 +15,7 @@
     'use strict';
 
     // ─── Konstanty & Úložiště ──────────────────────────────────────────────────
-    const CURRENT_VERSION = '1.1.0';
+    const CURRENT_VERSION = '1.2.0';
     const RAW_URL = 'https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js';
 
     const STORAGE = {
@@ -50,10 +50,10 @@
         { id: 2, label: '↕ Posun: Poslední produkt' },
     ];
 
-    // Selektory na Lidl.cz
+    // Selektory na Lidl.cz / Lidl.sk
     const SELECTORS = {
-        gridContainer:   '.s-product-grid, [data-testselector="s-product-grid__list"], .odsc-tile-grid',
-        productItem:     '[data-testselector="s-product-grid__list-item"]',
+        gridContainer:   'ol.s-product-grid, ul.s-product-grid, .s-product-grid, [data-testselector="s-product-grid__list"], .odsc-tile-grid',
+        productItem:     'li[id^="grid-item-"], ol.s-product-grid > li, ul.s-product-grid > li, .s-product-grid > li, [data-testselector="s-product-grid__list-item"], .product-grid-box',
         loadMoreButton:  'button.s-load-more__button',
         productsCount:   '.s-products-count__label',
         loadMoreText:    '.s-load-more__text',
@@ -80,6 +80,20 @@
     // ─── Styly ─────────────────────────────────────────────────────────────────
     const style = document.createElement('style');
     style.textContent = `
+        /* ── Spolehlivé skrytí nehodících se produktových karet ── */
+        li.lf-hidden, .lf-hidden {
+            display: none !important;
+            visibility: hidden !important;
+            height: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: none !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+        }
+
         #lf-bubble {
             position: fixed; bottom: 80px; right: 20px; z-index: 999999;
             width: 48px; height: 48px; border-radius: 50%;
@@ -578,10 +592,46 @@
         return Number.isFinite(num) ? num : NaN;
     }
 
+    // ─── Nalezení a normalizace karet produktů ────────────────────────────────
+    // Na Lidl.cz / Lidl.sk jsou produkty v mřížce obaleny v <li> elementech (např. <li id="grid-item-0-...">).
+    // Pro správné fungování CSS Gridu a odolnost vůči hydrataci Vue/Nuxt musíme skrývat
+    // a řadit přímo tyto rodičovské <li> elementy, nikoli jen jejich vnitřní elementy.
+    function getProductCards() {
+        const gridContainers = document.querySelectorAll(SELECTORS.gridContainer);
+        const cards = [];
+        const seen = new Set();
+
+        if (gridContainers.length > 0) {
+            gridContainers.forEach(grid => {
+                const lis = Array.from(grid.querySelectorAll(':scope > li, li[id^="grid-item-"]'));
+                lis.forEach(li => {
+                    const card = li.closest('li[id^="grid-item-"]') || li.closest('li') || li;
+                    if (!seen.has(card)) {
+                        seen.add(card);
+                        cards.push(card);
+                    }
+                });
+            });
+        }
+
+        if (cards.length === 0) {
+            const raw = document.querySelectorAll('li[id^="grid-item-"], [data-testselector="s-product-grid__list-item"], .product-grid-box');
+            raw.forEach(el => {
+                const card = el.closest('li[id^="grid-item-"]') || el.closest('li') || el;
+                if (!seen.has(card)) {
+                    seen.add(card);
+                    cards.push(card);
+                }
+            });
+        }
+
+        return cards;
+    }
+
     // ─── Extrakce informací o produktu a detekce baterie ─────────────────────────
-    // Lidl ukládá kompletní JSON do data-grid-data atributu každého produktu.
-    // Pro maximální rychlost výsledek cachujeme ve WeakMap.
-    function extractProductInfo(el) {
+    // Lidl ukládá kompletní JSON do data-grid-data atributu (při SSR).
+    // Po hydrataci Vue komponenty se data čerpají z DOMu nebo existující cache.
+    function extractProductInfo(card) {
         let title = '';
         let brand = '';
         let category = '';
@@ -591,16 +641,21 @@
         let discountPercent = 0;
         let absoluteDiscount = 0;
 
-        const rawData = el.getAttribute('data-grid-data') || el.dataset?.gridData;
+        // 1. Zkusíme data-grid-data (buď přímo na kartě, nebo v libovolném potomku)
+        const dataHolder = (card.hasAttribute && card.hasAttribute('data-grid-data'))
+            ? card
+            : (card.querySelector ? card.querySelector('[data-grid-data]') : null);
+
+        const rawData = dataHolder ? (dataHolder.getAttribute('data-grid-data') || dataHolder.dataset?.gridData) : null;
         if (rawData) {
             try {
                 const data = typeof rawData === 'string' ? JSON.parse(rawData) : rawData;
-                title = data.fullTitle || '';
+                title = data.fullTitle || data.title || '';
                 brand = data.brand?.name || '';
                 category = data.category || '';
 
                 if (data.keyfacts) {
-                    description = `${data.keyfacts.supplementalDescription || ''} ${data.keyfacts.description || ''}`;
+                    description = `${data.keyfacts.supplementalDescription || ''} ${data.keyfacts.description || ''}`.trim();
                 }
 
                 if (data.price) {
@@ -624,42 +679,65 @@
                     }
                 }
             } catch (err) {
-                // v případě chyby v JSON se použije DOM fallback níže
+                // v případě chyby v JSON fallbackujeme na DOM níže
             }
         }
 
-        // Fallback pro název z DOMu
-        if (!title) {
-            const titleEl = el.querySelector(
-                '.s-grid-box-skeleton__name, [data-testselector="product-title"], h2, h3, a.odsc-tile__link, .ods-typography-title-medium-bold'
+        // 2. DOM fallback pro název
+        if (!title && card.querySelector) {
+            const titleEl = card.querySelector(
+                '.product-grid-box__title, .product-grid-box-title, .s-grid-box-skeleton__name, [data-testselector="product-title"], h2, h3, a.odsc-tile__link, .ods-typography-title-medium-bold'
             );
             if (titleEl) title = titleEl.textContent.trim();
         }
 
-        // Fallback pro popis z DOMu
-        if (!description) {
-            description = el.textContent || '';
+        // 3. DOM fallback pro značku
+        if (!brand && card.querySelector) {
+            const brandEl = card.querySelector(
+                '.product-grid-box__brand, .product-grid-box-brand, [data-testselector="product-brand"]'
+            );
+            if (brandEl) brand = brandEl.textContent.trim();
         }
 
-        // Fallback pro cenu
-        if (isNaN(currentPrice)) {
-            const priceEl = el.querySelector(
-                '.ods-price-card__price, .s-grid-box-skeleton__price, [data-testselector="price"], .ods-typography-title-large-bold'
+        // 4. DOM fallback pro popis
+        if (!description) {
+            const descEl = card.querySelector ? card.querySelector('.product-grid-box__desc, .product-grid-box-desc, .keyfacts') : null;
+            description = descEl ? descEl.textContent.trim() : (card.textContent || '').trim();
+        }
+
+        // 5. DOM fallback pro cenu
+        if (isNaN(currentPrice) && card.querySelector) {
+            const priceEl = card.querySelector(
+                '.product-grid-box__price, .ods-price-card__price, .s-grid-box-skeleton__price, [data-testselector="price"], .ods-typography-title-large-bold'
             );
             if (priceEl) currentPrice = parsePrice(priceEl.textContent);
         }
 
-        // Fallback pro původní přeškrtnutou cenu
-        if (isNaN(oldPrice)) {
-            const strokeEl = el.querySelector(
-                '.ods-price-card__strikethrough-price, .ods-strikethrough-price, s, del, strike'
+        // 6. DOM fallback pro původní přeškrtnutou cenu
+        if (isNaN(oldPrice) && card.querySelector) {
+            const strokeEl = card.querySelector(
+                '.ods-price-card__strikethrough-price, .ods-strikethrough-price, s, del, strike, [class*="strikethrough"], [class*="stroke"]'
             );
             if (strokeEl) oldPrice = parsePrice(strokeEl.textContent);
         }
 
-        // Výpočet slevy pokud nebyla v datech explicitně
+        // 7. Detekce procenta slevy z DOMu (pokud nebylo v JSON)
+        // Lidl na kartách zobrazuje červený odznak např. "-33%", "-16%", "-50%"
+        if (discountPercent === 0 && card.textContent) {
+            const badgeMatch = card.textContent.match(/-\s*(\d{1,2})\s*%/);
+            if (badgeMatch) {
+                const parsed = parseInt(badgeMatch[1], 10);
+                if (parsed > 0 && parsed <= 99) {
+                    discountPercent = parsed;
+                }
+            }
+        }
+
+        // 8. Výpočet slevy pokud máme obě ceny
         if (discountPercent === 0 && !isNaN(oldPrice) && !isNaN(currentPrice) && oldPrice > currentPrice) {
             discountPercent = Math.round(((oldPrice - currentPrice) / oldPrice) * 100);
+        }
+        if (absoluteDiscount === 0 && !isNaN(oldPrice) && !isNaN(currentPrice) && oldPrice > currentPrice) {
             absoluteDiscount = Math.round(oldPrice - currentPrice);
         }
 
@@ -736,22 +814,30 @@
         };
     }
 
-    function getProductInfo(el) {
-        if (productDataCache.has(el)) {
-            return productDataCache.get(el);
+    function getProductInfo(card) {
+        if (productDataCache.has(card)) {
+            const cached = productDataCache.get(card);
+            if (cached && (cached.title || cached.currentPrice > 0)) {
+                return cached;
+            }
         }
-        const info = extractProductInfo(el);
-        productDataCache.set(el, info);
+        const info = extractProductInfo(card);
+        if (info && (info.title || info.currentPrice > 0)) {
+            productDataCache.set(card, info);
+        }
         return info;
     }
 
     // ─── Filtrační logika ──────────────────────────────────────────────────────
     function applyFilter() {
-        const products = Array.from(document.querySelectorAll(SELECTORS.productItem));
-        const total = products.length;
+        const cards = getProductCards();
+        const total = cards.length;
 
         if (!filteringEnabled) {
-            products.forEach(p => { p.style.display = ''; });
+            cards.forEach(card => {
+                card.classList.remove('lf-hidden');
+                card.style.removeProperty('display');
+            });
             updateCount(null, total);
             return;
         }
@@ -762,8 +848,8 @@
             : [];
 
         let shown = 0;
-        products.forEach(product => {
-            const info = getProductInfo(product);
+        cards.forEach(card => {
+            const info = getProductInfo(card);
 
             // 1. Textový filtr: všechna zadaná slova musí být v názvu / značce
             let textMatch = true;
@@ -799,8 +885,14 @@
             if (maxPrice !== null && info.currentPrice > maxPrice) priceMatch = false;
 
             const matches = textMatch && discountMatch && batteryMatch && priceMatch;
-            product.style.display = matches ? '' : 'none';
-            if (matches) shown++;
+            if (matches) {
+                card.classList.remove('lf-hidden');
+                card.style.removeProperty('display');
+                shown++;
+            } else {
+                card.classList.add('lf-hidden');
+                card.style.setProperty('display', 'none', 'important');
+            }
         });
 
         updateCount(shown, total);
@@ -844,8 +936,8 @@
 
         bubble.classList.toggle('active', active);
         if (active) {
-            const visibleCount = Array.from(document.querySelectorAll(SELECTORS.productItem))
-                .filter(p => p.style.display !== 'none').length;
+            const cards = getProductCards();
+            const visibleCount = cards.filter(card => !card.classList.contains('lf-hidden') && card.style.display !== 'none').length;
             bubbleBadge.textContent = String(visibleCount);
         }
     }
@@ -874,9 +966,9 @@
         if (!container) return;
 
         isSorting = true;
-        const items = Array.from(container.querySelectorAll(SELECTORS.productItem));
+        const cards = getProductCards();
 
-        items.sort((a, b) => {
+        cards.sort((a, b) => {
             const infoA = getProductInfo(a);
             const infoB = getProductInfo(b);
             switch (currentSortMode) {
@@ -894,7 +986,7 @@
         });
 
         // Připojení existujících uzlů aktualizuje jejich pozice v DOMu
-        items.forEach(el => container.appendChild(el));
+        cards.forEach(card => container.appendChild(card));
         setTimeout(() => { isSorting = false; }, 50);
     }
 
@@ -910,8 +1002,8 @@
     }
 
     function scrollToLatestVisibleProduct() {
-        const visible = Array.from(document.querySelectorAll(SELECTORS.productItem))
-            .filter(p => p.style.display !== 'none');
+        const cards = getProductCards();
+        const visible = cards.filter(card => !card.classList.contains('lf-hidden') && card.style.display !== 'none');
         if (visible.length > 0) {
             visible[visible.length - 1].scrollIntoView({ behavior: 'instant', block: 'nearest' });
         }
@@ -945,8 +1037,7 @@
     // Čeká na přidání nových produktů do DOMu
     function waitForMoreProducts(previousCount, maxWaitMs = 6000) {
         return new Promise(resolve => {
-            const target = document.querySelector(SELECTORS.gridContainer) || document.body;
-            const countNow = () => document.querySelectorAll(SELECTORS.productItem).length;
+            const countNow = () => getProductCards().length;
             if (countNow() > previousCount) return resolve(countNow());
 
             let done = false;
@@ -964,7 +1055,7 @@
             observer = new MutationObserver(() => {
                 if (countNow() > previousCount) finish();
             });
-            observer.observe(target, { childList: true, subtree: true });
+            observer.observe(document.body, { childList: true, subtree: true });
             timer = setTimeout(finish, maxWaitMs);
         });
     }
@@ -989,7 +1080,7 @@
                 reachedEnd = true;
                 break;
             }
-            const before = document.querySelectorAll(SELECTORS.productItem).length;
+            const before = getProductCards().length;
             const clicked = clickLoadMore();
             if (!clicked) {
                 reachedEnd = true;
@@ -1073,23 +1164,31 @@
         });
     }
 
-    // ─── MutationObserver pro dynamické produkty ──────────────────────────────
-    let gridObserverAttached = false;
-    function attachGridObserver() {
-        const target = document.querySelector(SELECTORS.gridContainer);
-        if (!target || gridObserverAttached) return;
+    // ─── MutationObserver pro dynamické produkty a hydrataci ──────────────────
+    let domObserverAttached = false;
+    let domDebounce = null;
+    function startDOMObserver() {
+        if (domObserverAttached) return;
+        domObserverAttached = true;
 
-        gridObserverAttached = true;
-        let debounceTimer = null;
-        new MutationObserver(() => {
+        new MutationObserver(mutations => {
             if (isSorting) return;
-            clearTimeout(debounceTimer);
-            debounceTimer = setTimeout(() => {
+            let hasChildMutation = false;
+            for (let i = 0; i < mutations.length; i++) {
+                if (mutations[i].type === 'childList') {
+                    hasChildMutation = true;
+                    break;
+                }
+            }
+            if (!hasChildMutation) return;
+
+            clearTimeout(domDebounce);
+            domDebounce = setTimeout(() => {
                 applyFilter();
                 applySort();
                 updateBubble();
-            }, 150);
-        }).observe(target, { childList: true, subtree: true });
+            }, 80);
+        }).observe(document.body, { childList: true, subtree: true });
     }
 
     // ─── Události ovládacích prvků ─────────────────────────────────────────────
@@ -1206,7 +1305,7 @@
         updateFilterToggle();
         updateScrollUI();
         updateSortUI();
-        attachGridObserver();
+        startDOMObserver();
         applyFilter();
         applySort();
         updateBubble();
@@ -1215,20 +1314,9 @@
 
     // Spuštění po načtení stránky a pojistka pro Single Page Application (Nuxt)
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => setTimeout(init, 500));
+        document.addEventListener('DOMContentLoaded', () => setTimeout(init, 300));
     } else {
-        setTimeout(init, 500);
+        setTimeout(init, 300);
     }
-
-    // Pojistka pro dynamické dočtení gridu
-    const bodyObserver = new MutationObserver(() => {
-        if (!gridObserverAttached && document.querySelector(SELECTORS.gridContainer)) {
-            attachGridObserver();
-            applyFilter();
-            applySort();
-            updateBubble();
-        }
-    });
-    bodyObserver.observe(document.body, { childList: true, subtree: true });
 
 })();
