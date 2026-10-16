@@ -1,13 +1,13 @@
 // ==UserScript==
 // @name         Lidl Product Filter
 // @namespace    http://tampermonkey.net/
-// @version      1.3.2
+// @version      1.3.3
 // @description  Filtrování produktů na Lidl.cz podle textu, slevy a přítomnosti akumulátoru (bez baterie / se sadou), efektivní dávkové přednačítání a řazení
 // @author       Filip J. & Tomi
 // @match        https://www.lidl.cz/*
 // @match        https://www.lidl.sk/*
 // @run-at       document-start
-// @grant        none
+// @grant        GM_xmlhttpRequest
 // @updateURL    https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js
 // @downloadURL  https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js
 // ==/UserScript==
@@ -122,7 +122,7 @@
     }
 
     // ─── Konstanty & Úložiště ──────────────────────────────────────────────────
-    const CURRENT_VERSION = '1.3.2';
+    const CURRENT_VERSION = '1.3.3';
     const RAW_URL = 'https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js';
 
     const STORAGE = {
