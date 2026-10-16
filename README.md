@@ -1,6 +1,6 @@
 # Lidl Product Filter 🛒
 
-Uživatelský skript (Tampermonkey / Greasemonkey) pro **Lidl.cz** a **Lidl.sk**, který umožňuje bleskurychle filtrovat a přednačítat produkty podle kombinace **textu** (názvu, značky), **velikosti slevy v %** a **cenového rozpětí**, s pokročilým řazením a hromadným načítáním stránek.
+Uživatelský skript (Tampermonkey / Greasemonkey) pro **Lidl.cz** a **Lidl.sk**, který umožňuje bleskurychle filtrovat a přednačítat produkty podle kombinace **textu** (názvu, značky), **přítomnosti akumulátoru v balení** (pouze nářadí bez baterií / sady), **velikosti slevy v %** a **cenového rozpětí**, s pokročilým řazením a hromadným načítáním stránek.
 
 Inspirováno a navrženo na základě [productFilter pro Alzu](https://github.com/RouSkiSroup/productFilter).
 
@@ -10,8 +10,12 @@ Inspirováno a navrženo na základě [productFilter pro Alzu](https://github.co
 
 - 🔍 **Kombinované filtrování:**
   - **Textové vyhledávání:** Okamžité filtrování při psaní (bez diakritiky, podpora více slov např. `aku vrtacka 20v` nebo `parkside performance`).
+  - **Filtr akumulátoru (Nářadí bez baterie):**
+    - `Vše`: nerozhoduje (zobrazí všechny produkty).
+    - `🚫 Bez baterie`: vybere **pouze nářadí bez akumulátoru a nabíječky** (*body only* / *– bez akumulátoru a nabíječky*), odfiltruje sady s bateriemi a samostatné nabíječky/akumulátory. Ideální pro ty, kteří už baterie mají doma!
+    - `🔋 S baterií`: vybere sady nářadí, kde je akumulátor přímo součástí balení.
   - **Minimální sleva:** Presety `Vše` (i bez slevy), `> 0 %` (jakákoliv sleva), `≥ 10 %`, `≥ 20 %`, `≥ 30 %`, `≥ 40 %`, `≥ 50 %`, `≥ 60 %`.
-  - **Kombinace filtrů:** Lze filtrovat např. *jen vrtačka* (bez ohledu na slevu), *vrtačka se slevou nad 30 %*, nebo *jakýkoliv produkt se slevou nad 50 %*.
+  - **Kombinace filtrů:** Lze filtrovat např. *vrtačka* + *bez baterie* + *sleva nad 30 %*, nebo jen *bez baterie* + *sleva nad 50 %*.
   - **Cenové rozpětí:** Volitelný filtr pro minimální a maximální cenu (Kč).
 - 🚀 **Bleskurychlé hromadné načítání (Preloading):**
   - **1 dávka:** Tlačítko pro načtení další dávky 48 produktů nebo stisknutí klávesy **`Ctrl`**.
@@ -49,12 +53,14 @@ Inspirováno a navrženo na základě [productFilter pro Alzu](https://github.co
 
 ---
 
-## 🛠 Jak to funguje
+## 🛠 Jak funguje detekce "bez baterie"
 
-- **Bleskurychlá extrakce:** Lidl do DOM elementů každého produktu vkládá strukturovaná data v atributu `data-grid-data`. Skript je bleskově extrahuje a ukládá do paměti (`WeakMap`). Díky tomu textové a slevové filtrování probíhá za méně než **1 milisekundu** i při stovkách načtených položek.
-- **Klávesové zkratky:**
-  - Stisknutí klávesy **`Ctrl`** (když zrovna nepíšete do textového pole) okamžitě načte další dávku produktů.
-- **Odznak na bublině:** Pokud panel minimalizujete tlačítkem `−`, bublina v pravém dolním rohu vám stále ukazuje aktuální počet nalezených produktů.
+Lidl má u nářadí Parkside a dalších značek velmi striktní a systematické značení:
+1. **Verze bez baterie:** v názvu mívají `– bez akumulátoru a nabíječky` / `(bez akumulátoru)` a v popisu `Akumulátor a nabíječka nejsou součástí balení` či `Doporučený akumulátor: 20 V`.
+2. **Sady s baterií:** v názvu mají kapacitu, např. `, Smart 8 Ah`, `, 2 Ah`, `, 2x 4 Ah` a v popisu rozpis `Složení sady: 1x ... akumulátor ...`.
+3. **Samostatné akumulátory/nabíječky:** skript je identifikuje a v režimu `🚫 Bez baterie` vyřazuje, takže vidíte pouze samotné stroje a nářadí.
+
+Všechna tato data skript extrahuje z atributu `data-grid-data` a cachuje v paměti (`WeakMap`), takže filtrování funguje za méně než **1 milisekundu**.
 
 ---
 

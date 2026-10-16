@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Lidl Product Filter
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
-// @description  Filtrování produktů na Lidl.cz podle textu a velikosti slevy, efektivní dávkové přednačítání a pokročilé řazení
+// @version      1.1.0
+// @description  Filtrování produktů na Lidl.cz podle textu, slevy a přítomnosti akumulátoru (bez baterie / se sadou), efektivní dávkové přednačítání a řazení
 // @author       Filip J. & Tomi
 // @match        https://www.lidl.cz/*
 // @match        https://www.lidl.sk/*
@@ -15,12 +15,13 @@
     'use strict';
 
     // ─── Konstanty & Úložiště ──────────────────────────────────────────────────
-    const CURRENT_VERSION = '1.0.0';
+    const CURRENT_VERSION = '1.1.0';
     const RAW_URL = 'https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js';
 
     const STORAGE = {
         minDiscount:   'lf_min_discount',
         textQuery:     'lf_text_query',
+        batteryMode:   'lf_battery_mode',
         filterEnabled: 'lf_filter_enabled',
         batches:       'lf_batches',
         minimized:     'lf_minimized',
@@ -61,6 +62,7 @@
     // ─── Stav ──────────────────────────────────────────────────────────────────
     let minDiscount        = -1;       // -1 = Vše, 0 = jakákoliv sleva, 10-60 = %
     let textQuery          = '';       // Text pro vyhledávání
+    let batteryMode        = 'all';    // 'all' | 'without' | 'with'
     let minPrice           = null;     // Minimální cena v Kč
     let maxPrice           = null;     // Maximální cena v Kč
     let filteringEnabled   = false;    // Hlavní přepínač filtru
@@ -104,7 +106,7 @@
 
         #lf-panel {
             position: fixed; bottom: 80px; right: 20px; z-index: 999999;
-            width: 320px; border-radius: 16px;
+            width: 324px; border-radius: 16px;
             background: rgba(15, 17, 28, 0.94);
             backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px);
             border: 1px solid rgba(255, 255, 255, 0.12);
@@ -193,6 +195,23 @@
             padding: 2px; display: none; line-height: 1;
         }
         #lf-text-clear:hover { color: #fff; }
+
+        /* ── Filtr akumulátoru ── */
+        #lf-battery-presets {
+            display: flex; gap: 4px; margin-bottom: 10px;
+        }
+        .lf-battery-btn {
+            flex: 1; padding: 6px 3px; border: 1px solid rgba(255, 255, 255, 0.14);
+            border-radius: 6px; background: rgba(255, 255, 255, 0.06);
+            color: #94a3b8; font-size: 10.5px; font-weight: 600; cursor: pointer;
+            transition: background 0.15s, color 0.15s, border-color 0.15s;
+            text-align: center; white-space: nowrap;
+        }
+        .lf-battery-btn:hover { background: rgba(255, 255, 255, 0.14); color: #f1f5f9; }
+        .lf-battery-btn.selected {
+            background: linear-gradient(135deg, #0050aa, #2563eb);
+            color: #fff; border-color: #60a5fa; box-shadow: 0 2px 8px rgba(37, 99, 235, 0.4);
+        }
 
         /* ── Presety slev ── */
         #lf-discount-presets {
@@ -332,6 +351,14 @@
                     <button type="button" id="lf-text-clear" title="Vymazat">✕</button>
                 </div>
 
+                <!-- Filtr akumulátoru -->
+                <label class="lf-label">Akumulátor v balení</label>
+                <div id="lf-battery-presets">
+                    <button type="button" class="lf-battery-btn selected" data-battery="all" title="Všechny produkty (nerozhoduje)">Vše</button>
+                    <button type="button" class="lf-battery-btn" data-battery="without" title="Pouze nářadí bez akumulátoru a nabíječky (body only)">🚫 Bez baterie</button>
+                    <button type="button" class="lf-battery-btn" data-battery="with" title="Pouze sady s akumulátorem v balení">🔋 S baterií</button>
+                </div>
+
                 <!-- Sleva -->
                 <label class="lf-label">Minimální sleva</label>
                 <div id="lf-discount-presets"></div>
@@ -415,6 +442,24 @@
         presetsEl.appendChild(btn);
     });
 
+    // ─── Tlačítka filtru akumulátoru ───────────────────────────────────────────
+    document.querySelectorAll('.lf-battery-btn').forEach(btn => {
+        btn.addEventListener('click', () => {
+            batteryMode = btn.dataset.battery || 'all';
+            save(STORAGE.batteryMode, batteryMode);
+            renderBatteryPresets();
+            applyFilter();
+            applySort();
+            updateBubble();
+        });
+    });
+
+    function renderBatteryPresets() {
+        document.querySelectorAll('.lf-battery-btn').forEach(btn => {
+            btn.classList.toggle('selected', btn.dataset.battery === batteryMode);
+        });
+    }
+
     // ─── Drag & Drop panelu a bubliny ──────────────────────────────────────────
     function makeDraggable(el, handle) {
         let dragging = false, ox = 0, oy = 0, didMove = false;
@@ -465,6 +510,10 @@
         minDiscount = DISCOUNT_PRESETS.includes(savedDiscount) ? savedDiscount : -1;
         renderDiscountPresets();
 
+        const savedBattery = localStorage.getItem(STORAGE.batteryMode);
+        batteryMode = ['all', 'without', 'with'].includes(savedBattery) ? savedBattery : 'all';
+        renderBatteryPresets();
+
         textQuery = localStorage.getItem(STORAGE.textQuery) || '';
         textInput.value = textQuery;
         textClearBtn.style.display = textQuery ? 'block' : 'none';
@@ -510,7 +559,7 @@
     // ─── Normalizace textu (bez diakritiky) ────────────────────────────────────
     function normalize(str) {
         if (!str) return '';
-        return str
+        return String(str)
             .toLowerCase()
             .normalize('NFD')
             .replace(/[\u0300-\u036f]/g, '')
@@ -529,13 +578,14 @@
         return Number.isFinite(num) ? num : NaN;
     }
 
-    // ─── Extrakce informací o produktu ─────────────────────────────────────────
+    // ─── Extrakce informací o produktu a detekce baterie ─────────────────────────
     // Lidl ukládá kompletní JSON do data-grid-data atributu každého produktu.
     // Pro maximální rychlost výsledek cachujeme ve WeakMap.
     function extractProductInfo(el) {
         let title = '';
         let brand = '';
         let category = '';
+        let description = '';
         let currentPrice = NaN;
         let oldPrice = NaN;
         let discountPercent = 0;
@@ -548,6 +598,10 @@
                 title = data.fullTitle || '';
                 brand = data.brand?.name || '';
                 category = data.category || '';
+
+                if (data.keyfacts) {
+                    description = `${data.keyfacts.supplementalDescription || ''} ${data.keyfacts.description || ''}`;
+                }
 
                 if (data.price) {
                     if (typeof data.price.price === 'number') {
@@ -574,12 +628,17 @@
             }
         }
 
-        // Fallback pro název
+        // Fallback pro název z DOMu
         if (!title) {
             const titleEl = el.querySelector(
                 '.s-grid-box-skeleton__name, [data-testselector="product-title"], h2, h3, a.odsc-tile__link, .ods-typography-title-medium-bold'
             );
             if (titleEl) title = titleEl.textContent.trim();
+        }
+
+        // Fallback pro popis z DOMu
+        if (!description) {
+            description = el.textContent || '';
         }
 
         // Fallback pro cenu
@@ -606,6 +665,64 @@
 
         const searchText = normalize(`${title} ${brand} ${category}`);
 
+        // ─── Klasifikace akumulátoru ───
+        // 'WITHOUT'      = AKU nářadí bez akumulátoru a nabíječky (body only)
+        // 'WITH'         = Sady nářadí s akumulátorem v balení (např. Smart 8 Ah, 2 Ah, složení sady)
+        // 'BATTERY_ONLY' = Samostatný akumulátor nebo nabíječka (nikoli nářadí)
+        // 'OTHER'        = Ostatní produkty (síťové nářadí, zahradní nábytek, oblečení...)
+        let batteryStatus = 'OTHER';
+
+        const normTitle = normalize(title);
+        const fullDescText = normalize(`${title} ${description}`);
+
+        const toolKeywords = [
+            'vrtacka', 'sroubovak', 'kladivo', 'pila', 'bruska', 'utahovak',
+            'kompresor', 'pumpa', 'pistole', 'hoblik', 'nuzky', 'vysavac',
+            'sekacka', 'vyzinac', 'fukar', 'svitilna', 'reflektor', 'freza',
+            'sponkovacka', 'nytovacka', 'krovinorez', 'pajecka', 'multinaradi',
+            'cistic', 'mycka', 'kartac', 'multibruska', 'cerpadlo', 'postrikovac',
+            'misenka', 'retezova', 'pokosova', 'ocaska', 'tavna'
+        ];
+        const hasToolKeyword = toolKeywords.some(k => normTitle.includes(k));
+
+        const isStandaloneBatteryOrCharger = !hasToolKeyword &&
+            /\b(akumulator|baterie|nabijecka|smart akumulator|nabijeci)\b/i.test(normTitle);
+
+        const withoutPatterns = [
+            /bez\s+akumulator/i,
+            /bez\s+bater/i,
+            /\bbez\s+aku\b/i,
+            /nejsou\s+soucasti\s+baleni/i,
+            /neni\s+soucasti\s+baleni/i,
+            /doporuceny\s+akumulator/i,
+            /\bbody\s+only\b/i
+        ];
+        const hasWithout = withoutPatterns.some(p => p.test(fullDescText));
+
+        const withPatterns = [
+            /,\s*(?:smart\s+)?\d+(?:,\d+)?\s*ah\b/i,
+            /,\s*\d+x\s*(?:smart\s+)?\d+(?:,\d+)?\s*ah\b/i,
+            /\b\d+(?:,\d+)?\s*ah\s+a\s+\d+(?:,\d+)?\s*ah\b/i,
+            /vcetne\s+akumulator/i,
+            /vcetne\s+bater/i,
+            /s\s+akumulatorem/i,
+            /s\s+baterii/i,
+            /slozeni\s+sady:.*?(?:akumulator|baterie)/i
+        ];
+        const hasWith = withPatterns.some(p => p.test(fullDescText));
+
+        if (isStandaloneBatteryOrCharger) {
+            batteryStatus = 'BATTERY_ONLY';
+        } else if (hasWithout && !hasWith) {
+            batteryStatus = 'WITHOUT';
+        } else if (hasWith && !hasWithout) {
+            batteryStatus = 'WITH';
+        } else if (hasWithout && hasWith) {
+            batteryStatus = /bez\s+akumulator/i.test(normTitle) ? 'WITHOUT' : 'WITH';
+        } else if (/\baku\b/i.test(normTitle)) {
+            batteryStatus = 'AKU_UNSPECIFIED';
+        }
+
         return {
             title,
             brand,
@@ -615,6 +732,7 @@
             discountPercent,
             absoluteDiscount,
             searchText,
+            batteryStatus,
         };
     }
 
@@ -664,12 +782,23 @@
                 discountMatch = info.discountPercent >= minDiscount;
             }
 
-            // 3. Cenový filtr
+            // 3. Filtr akumulátoru:
+            //    'all'     = bez omezení (jakékoliv produkty)
+            //    'without' = pouze nářadí bez akumulátoru a nabíječky (body only)
+            //    'with'    = pouze sady s akumulátorem
+            let batteryMatch = true;
+            if (batteryMode === 'without') {
+                batteryMatch = info.batteryStatus === 'WITHOUT';
+            } else if (batteryMode === 'with') {
+                batteryMatch = info.batteryStatus === 'WITH';
+            }
+
+            // 4. Cenový filtr
             let priceMatch = true;
             if (minPrice !== null && info.currentPrice < minPrice) priceMatch = false;
             if (maxPrice !== null && info.currentPrice > maxPrice) priceMatch = false;
 
-            const matches = textMatch && discountMatch && priceMatch;
+            const matches = textMatch && discountMatch && batteryMatch && priceMatch;
             product.style.display = matches ? '' : 'none';
             if (matches) shown++;
         });
