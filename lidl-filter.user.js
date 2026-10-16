@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lidl Product Filter
 // @namespace    http://tampermonkey.net/
-// @version      1.3.3
+// @version      1.3.4
 // @description  Filtrování produktů na Lidl.cz podle textu, slevy a přítomnosti akumulátoru (bez baterie / se sadou), efektivní dávkové přednačítání a řazení
 // @author       Filip J. & Tomi
 // @match        https://www.lidl.cz/*
@@ -122,7 +122,7 @@
     }
 
     // ─── Konstanty & Úložiště ──────────────────────────────────────────────────
-    const CURRENT_VERSION = '1.3.3';
+    const CURRENT_VERSION = '1.3.4';
     const RAW_URL = 'https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js';
 
     const STORAGE = {
@@ -1182,18 +1182,23 @@
 
         const lmText = document.querySelector(SELECTORS.loadMoreText);
         if (lmText && lmText.textContent) {
-            const m = lmText.textContent.match(/(\d+)\s*\/\s*(\d+)/);
+            const m = lmText.textContent.match(/([\d\s]+)\s*(?:\/|z)\s*([\d\s]+)/i);
             if (m) {
-                const cur = parseInt(m[1].replace(/\s+/g, ''), 10);
-                const tot = parseInt(m[2].replace(/\s+/g, ''), 10);
+                const cur = parseInt(m[1].replace(/[^\d]/g, ''), 10);
+                const tot = parseInt(m[2].replace(/[^\d]/g, ''), 10);
                 if (cur > 0 && tot > 0 && cur >= tot) return true;
             }
         }
+
+        // Pokud tlačítko v DOMu vůbec neexistuje po načtení produktů, je to konec
+        const btn = document.querySelector(SELECTORS.loadMoreButton);
+        if (!btn && (currentCards > 0 || (fetched && fetched > 0))) return true;
+
         return false;
     }
 
     // Čeká, až bude tlačítko pro načtení další dávky přítomné v DOMu a připravené ke kliknutí
-    async function waitForButtonReady(maxWaitMs = 15000) {
+    async function waitForButtonReady(maxWaitMs = 8000) {
         const startTime = Date.now();
         while (Date.now() - startTime < maxWaitMs) {
             if (stopRequested) return null;
@@ -1205,6 +1210,9 @@
                 if (!isDisabled) {
                     return btn;
                 }
+            } else {
+                await new Promise(r => setTimeout(r, 200));
+                if (!getLoadMoreButton()) return null;
             }
             await new Promise(r => setTimeout(r, 120));
         }
@@ -1304,17 +1312,20 @@
             }
 
             // 2. Počkáme, až bude tlačítko přítomné a povolené ke kliknutí (až doběhne předchozí render)
-            const btn = await waitForButtonReady(12000);
+            const btn = await waitForButtonReady(8000);
             if (stopRequested) break;
 
             if (!btn) {
-                if (isCatalogFullyLoaded()) {
+                if (isCatalogFullyLoaded() || !getLoadMoreButton()) {
                     reachedEnd = true;
                     break;
                 }
                 consecutiveRetries++;
-                if (consecutiveRetries >= 3) break;
-                await new Promise(r => setTimeout(r, 800));
+                if (consecutiveRetries >= 2) {
+                    reachedEnd = true;
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 500));
                 continue;
             }
 
@@ -1335,14 +1346,21 @@
                 const currentCount = Math.max(result.fetched || 0, result.cards || 0);
                 const totalStr = total ? ` (${currentCount.toLocaleString('cs-CZ')} / ${total.toLocaleString('cs-CZ')})` : ` (${currentCount} produktů)`;
                 loadStatus.textContent = `Načítání: ${currentLoadedBatches} / ${targetLabel}${totalStr}`;
+
+                // Průběžná aktualizace filtrů a počítadla v reálném čase během načítání
+                applyFilter();
+                updateBubble();
             } else {
-                if (isCatalogFullyLoaded()) {
+                if (isCatalogFullyLoaded() || !getLoadMoreButton()) {
                     reachedEnd = true;
                     break;
                 }
                 consecutiveRetries++;
-                if (consecutiveRetries >= 3) break;
-                await new Promise(r => setTimeout(r, 800));
+                if (consecutiveRetries >= 2) {
+                    reachedEnd = true;
+                    break;
+                }
+                await new Promise(r => setTimeout(r, 500));
                 continue;
             }
 
