@@ -64,6 +64,18 @@ Všechna tato data skript extrahuje z atributu `data-grid-data` a cachuje v pam�
 
 ---
 
+## 🚀 Jak skript zvládá tisíce produktů bez sekání prohlížeče
+
+Lidl na svých stránkách ve výchozím stavu používá komponentu `SNBBatchRenderComponent` s `IntersectionObserverem`, která jakoukoliv dávku produktů (48 položek) po odrolování o více než 1040 px nahoru **kompletně smaže z DOMu** a nahradí ji prázdným komentářem `<!---->`. Kvůli tomu:
+- Nebylo možné v odrolovaných produktech vyhledávat textem.
+- Načítání se předčasně zastavovalo, protože počet produktů v DOMu kvůli mazání nerostl.
+
+**Řešení ve verzi 1.3.0:**
+1. **Zachování všech produktů v paměti DOM:** Skript zachytí `IntersectionObserver` tak, aby Lidl dávky neodstraňoval. Všechny načtené produkty zůstávají dostupné pro okamžité filtrování textem, slevou i cenou.
+2. **Hardwarová C++ akcelerace (`content-visibility: auto`):** Aby se prohlížeč nezahltil a nesekal při tisících položek, skript aplikuje nativní CSS vlastnost `content-visibility: auto` s `contain-intrinsic-size`. Jádro prohlížeče (Blink/WebKit) tak kompletně přeskakuje layout a vykreslování položek mimo obrazovku, což zajišťuje hladké posouvání (60/120 FPS) s minimální spotřebou RAM a procesoru.
+
+---
+
 ## 📝 Licence
 
 MIT License.

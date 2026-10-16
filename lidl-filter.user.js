@@ -1,11 +1,12 @@
 // ==UserScript==
 // @name         Lidl Product Filter
 // @namespace    http://tampermonkey.net/
-// @version      1.2.0
+// @version      1.3.0
 // @description  Filtrování produktů na Lidl.cz podle textu, slevy a přítomnosti akumulátoru (bez baterie / se sadou), efektivní dávkové přednačítání a řazení
 // @author       Filip J. & Tomi
 // @match        https://www.lidl.cz/*
 // @match        https://www.lidl.sk/*
+// @run-at       document-start
 // @updateURL    https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js
 // @downloadURL  https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js
 // @grant        GM_xmlhttpRequest
@@ -14,8 +15,62 @@
 (function () {
     'use strict';
 
+    // ─── Prevence unmountování dávek Lidlem ────────────────────────────────────
+    // Lidl ve Vue komponentě SNBBatchRenderComponent používá IntersectionObserver s rootMargin "1040px 0px 1040px 0px".
+    // Když se dávka odroluje nahoru, Lidl ji kompletně odmountuje z DOMu (nahradí prázdným komentářem <!---->).
+    // Tím přijdeme o načtené produkty pro textové filtrování a getProductCards().length přestane růst,
+    // což způsobovalo předčasné zastavení načítání.
+    // Zachycením IntersectionObserveru zajistíme, že isIntersecting je pro dávky vždy true,
+    // takže produkty zůstávají trvale v DOMu a lze v nich kdykoliv bleskově hledat.
+    // Pro plynulost renderingu se o hardwarovou akceleraci stará CSS content-visibility: auto.
+    function patchIntersectionObserver(targetWin) {
+        if (!targetWin || !targetWin.IntersectionObserver) return;
+        if (targetWin.__lf_io_patched) return;
+        targetWin.__lf_io_patched = true;
+
+        const NativeIntersectionObserver = targetWin.IntersectionObserver;
+        targetWin.IntersectionObserver = function (callback, options) {
+            const isBatchObserver = options?.rootMargin === '1040px 0px 1040px 0px';
+            const wrappedCallback = (entries, observer) => {
+                for (let i = 0; i < entries.length; i++) {
+                    const entry = entries[i];
+                    const target = entry.target;
+                    const isBatch = isBatchObserver ||
+                        (target && (target.classList?.contains('s-product-batch') || target.matches?.('.s-product-batch')));
+                    if (isBatch) {
+                        try {
+                            Object.defineProperty(entry, 'isIntersecting', {
+                                value: true,
+                                writable: true,
+                                configurable: true
+                            });
+                        } catch (e) {
+                            try {
+                                entries[i] = new Proxy(entry, {
+                                    get(t, p, r) {
+                                        if (p === 'isIntersecting') return true;
+                                        const v = Reflect.get(t, p, r);
+                                        return typeof v === 'function' ? v.bind(t) : v;
+                                    }
+                                });
+                            } catch (e2) {}
+                        }
+                    }
+                }
+                return callback(entries, observer);
+            };
+            return new NativeIntersectionObserver(wrappedCallback, options);
+        };
+        targetWin.IntersectionObserver.prototype = NativeIntersectionObserver.prototype;
+    }
+
+    patchIntersectionObserver(window);
+    if (typeof unsafeWindow !== 'undefined' && unsafeWindow !== window) {
+        patchIntersectionObserver(unsafeWindow);
+    }
+
     // ─── Konstanty & Úložiště ──────────────────────────────────────────────────
-    const CURRENT_VERSION = '1.2.0';
+    const CURRENT_VERSION = '1.3.0';
     const RAW_URL = 'https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js';
 
     const STORAGE = {
@@ -53,7 +108,7 @@
     // Selektory na Lidl.cz / Lidl.sk
     const SELECTORS = {
         gridContainer:   'ol.s-product-grid, ul.s-product-grid, .s-product-grid, [data-testselector="s-product-grid__list"], .odsc-tile-grid',
-        productItem:     'li[id^="grid-item-"], ol.s-product-grid > li, ul.s-product-grid > li, .s-product-grid > li, [data-testselector="s-product-grid__list-item"], .product-grid-box',
+        productItem:     'li[id^="grid-item-"], .s-product-batch > li, ol.s-product-grid > li, ul.s-product-grid > li, .s-product-grid > li, [data-testselector="s-product-grid__list-item"], .product-grid-box',
         loadMoreButton:  'button.s-load-more__button',
         productsCount:   '.s-products-count__label',
         loadMoreText:    '.s-load-more__text',
@@ -80,6 +135,12 @@
     // ─── Styly ─────────────────────────────────────────────────────────────────
     const style = document.createElement('style');
     style.textContent = `
+        /* ── Optimalizace renderingu pro tisíce produktů (HW akcelerace prohlížeče) ── */
+        .s-product-batch {
+            content-visibility: auto;
+            contain-intrinsic-size: 1px 1200px;
+        }
+
         /* ── Spolehlivé skrytí nehodících se produktových karet ── */
         li.lf-hidden, .lf-hidden {
             display: none !important;
@@ -329,14 +390,12 @@
             vertical-align: middle; margin-right: 5px;
         }
     `;
-    document.head.appendChild(style);
 
     // ─── Stavba UI ─────────────────────────────────────────────────────────────
     const bubble = document.createElement('div');
     bubble.id = 'lf-bubble';
     bubble.title = 'Lidl Product Filter';
     bubble.innerHTML = '🔍<span id="lf-bubble-badge">0</span>';
-    document.body.appendChild(bubble);
 
     const panel = document.createElement('div');
     panel.id = 'lf-panel';
@@ -407,27 +466,26 @@
             </div>
         </div>
     `;
-    document.body.appendChild(panel);
 
     // ─── Reference na elementy ─────────────────────────────────────────────────
-    const presetsEl       = document.getElementById('lf-discount-presets');
-    const filterSection   = document.getElementById('lf-filter-section');
-    const loadStatus      = document.getElementById('lf-load-status');
-    const textInput       = document.getElementById('lf-text-input');
-    const textClearBtn    = document.getElementById('lf-text-clear');
-    const minPriceInput   = document.getElementById('lf-min-price');
-    const maxPriceInput   = document.getElementById('lf-max-price');
-    const batchesInput    = document.getElementById('lf-batches-input');
-    const toggleFilterBtn = document.getElementById('lf-toggle-filter');
-    const loadOneBtn      = document.getElementById('lf-load-one');
-    const loadManyBtn     = document.getElementById('lf-load-many');
-    const toggleSortBtn   = document.getElementById('lf-toggle-sort');
-    const toggleScrollBtn = document.getElementById('lf-toggle-scroll');
-    const stopBtn         = document.getElementById('lf-stop');
-    const stopRow         = document.getElementById('lf-stop-row');
-    const countEl         = document.getElementById('lf-count');
-    const bubbleBadge     = document.getElementById('lf-bubble-badge');
-    const minimizeBtn     = document.getElementById('lf-minimize');
+    const presetsEl       = panel.querySelector('#lf-discount-presets');
+    const filterSection   = panel.querySelector('#lf-filter-section');
+    const loadStatus      = panel.querySelector('#lf-load-status');
+    const textInput       = panel.querySelector('#lf-text-input');
+    const textClearBtn    = panel.querySelector('#lf-text-clear');
+    const minPriceInput   = panel.querySelector('#lf-min-price');
+    const maxPriceInput   = panel.querySelector('#lf-max-price');
+    const batchesInput    = panel.querySelector('#lf-batches-input');
+    const toggleFilterBtn = panel.querySelector('#lf-toggle-filter');
+    const loadOneBtn      = panel.querySelector('#lf-load-one');
+    const loadManyBtn     = panel.querySelector('#lf-load-many');
+    const toggleSortBtn   = panel.querySelector('#lf-toggle-sort');
+    const toggleScrollBtn = panel.querySelector('#lf-toggle-scroll');
+    const stopBtn         = panel.querySelector('#lf-stop');
+    const stopRow         = panel.querySelector('#lf-stop-row');
+    const countEl         = panel.querySelector('#lf-count');
+    const bubbleBadge     = bubble.querySelector('#lf-bubble-badge');
+    const minimizeBtn     = panel.querySelector('#lf-minimize');
 
     // ─── Tlačítka slevových presetů ────────────────────────────────────────────
     DISCOUNT_PRESETS.forEach(val => {
@@ -457,7 +515,7 @@
     });
 
     // ─── Tlačítka filtru akumulátoru ───────────────────────────────────────────
-    document.querySelectorAll('.lf-battery-btn').forEach(btn => {
+    panel.querySelectorAll('.lf-battery-btn').forEach(btn => {
         btn.addEventListener('click', () => {
             batteryMode = btn.dataset.battery || 'all';
             save(STORAGE.batteryMode, batteryMode);
@@ -469,7 +527,7 @@
     });
 
     function renderBatteryPresets() {
-        document.querySelectorAll('.lf-battery-btn').forEach(btn => {
+        panel.querySelectorAll('.lf-battery-btn').forEach(btn => {
             btn.classList.toggle('selected', btn.dataset.battery === batteryMode);
         });
     }
@@ -509,7 +567,7 @@
         }, true);
     }
 
-    makeDraggable(panel, document.getElementById('lf-drag-handle'));
+    makeDraggable(panel, panel.querySelector('#lf-drag-handle'));
     makeDraggable(bubble, bubble);
 
     // ─── Ukládání a načítání stavu ─────────────────────────────────────────────
@@ -561,7 +619,7 @@
     }
 
     function renderDiscountPresets() {
-        document.querySelectorAll('.lf-discount-btn').forEach(btn => {
+        panel.querySelectorAll('.lf-discount-btn').forEach(btn => {
             btn.classList.toggle('selected', parseInt(btn.dataset.discount, 10) === minDiscount);
         });
     }
@@ -603,7 +661,7 @@
 
         if (gridContainers.length > 0) {
             gridContainers.forEach(grid => {
-                const lis = Array.from(grid.querySelectorAll(':scope > li, li[id^="grid-item-"]'));
+                const lis = Array.from(grid.querySelectorAll('li[id^="grid-item-"], .s-product-batch > li, :scope > li, [data-testselector="s-product-grid__list-item"], .product-grid-box'));
                 lis.forEach(li => {
                     const card = li.closest('li[id^="grid-item-"]') || li.closest('li') || li;
                     if (!seen.has(card)) {
@@ -615,7 +673,7 @@
         }
 
         if (cards.length === 0) {
-            const raw = document.querySelectorAll('li[id^="grid-item-"], [data-testselector="s-product-grid__list-item"], .product-grid-box');
+            const raw = document.querySelectorAll('li[id^="grid-item-"], .s-product-batch > li, [data-testselector="s-product-grid__list-item"], .product-grid-box');
             raw.forEach(el => {
                 const card = el.closest('li[id^="grid-item-"]') || el.closest('li') || el;
                 if (!seen.has(card)) {
@@ -1019,15 +1077,46 @@
         return document.querySelector(SELECTORS.loadMoreButton);
     }
 
-    function isAtLastBatch() {
-        const btn = getLoadMoreButton();
-        if (!btn || btn.offsetParent === null || btn.disabled) return true;
+    function isCatalogFullyLoaded() {
+        const total = getTotalCatalogCount();
+        const current = getProductCards().length;
+        if (total && total > 0 && current >= total) {
+            return true;
+        }
+        const lmText = document.querySelector(SELECTORS.loadMoreText);
+        if (lmText) {
+            const m = lmText.textContent.match(/(\d+)\s*\/\s*(\d+)/);
+            if (m) {
+                const cur = parseInt(m[1].replace(/\s+/g, ''), 10);
+                const tot = parseInt(m[2].replace(/\s+/g, ''), 10);
+                if (cur > 0 && tot > 0 && cur >= tot) return true;
+            }
+        }
         return false;
     }
 
-    function clickLoadMore() {
-        const btn = getLoadMoreButton();
-        if (btn && !btn.disabled) {
+    // Čeká, až bude tlačítko pro načtení další dávky přítomné v DOMu a připravené ke kliknutí
+    async function waitForButtonReady(maxWaitMs = 15000) {
+        const startTime = Date.now();
+        while (Date.now() - startTime < maxWaitMs) {
+            if (stopRequested) return null;
+            if (isCatalogFullyLoaded()) return null;
+
+            const btn = getLoadMoreButton();
+            if (btn) {
+                const isDisabled = btn.disabled || btn.hasAttribute('disabled') || btn.classList.contains('is-loading');
+                if (!isDisabled) {
+                    return btn;
+                }
+            }
+            await new Promise(r => setTimeout(r, 100));
+        }
+        return null;
+    }
+
+    async function loadOneBatch() {
+        const btn = await waitForButtonReady(4000);
+        if (btn) {
             btn.click();
             return true;
         }
@@ -1035,19 +1124,21 @@
     }
 
     // Čeká na přidání nových produktů do DOMu
-    function waitForMoreProducts(previousCount, maxWaitMs = 6000) {
+    function waitForMoreProducts(previousCount, maxWaitMs = 15000) {
         return new Promise(resolve => {
             const countNow = () => getProductCards().length;
             if (countNow() > previousCount) return resolve(countNow());
 
             let done = false;
             let observer = null;
+            let interval = null;
             let timer = null;
 
             const finish = () => {
                 if (done) return;
                 done = true;
                 if (observer) observer.disconnect();
+                if (interval) clearInterval(interval);
                 if (timer) clearTimeout(timer);
                 resolve(countNow());
             };
@@ -1056,6 +1147,11 @@
                 if (countNow() > previousCount) finish();
             });
             observer.observe(document.body, { childList: true, subtree: true });
+
+            interval = setInterval(() => {
+                if (countNow() > previousCount) finish();
+            }, 150);
+
             timer = setTimeout(finish, maxWaitMs);
         });
     }
@@ -1075,33 +1171,56 @@
         loadStatus.textContent = `Načítání: 0 / ${targetLabel}`;
 
         let reachedEnd = false;
+        let consecutiveRetries = 0;
+
         while (!stopRequested && (loadAll || currentLoadedBatches < multiLoadBatches)) {
-            if (isAtLastBatch()) {
-                reachedEnd = true;
-                break;
-            }
-            const before = getProductCards().length;
-            const clicked = clickLoadMore();
-            if (!clicked) {
+            // 1. Zkontrolujeme, zda již nemáme celý katalog
+            if (isCatalogFullyLoaded()) {
                 reachedEnd = true;
                 break;
             }
 
-            const after = await waitForMoreProducts(before);
+            // 2. Počkáme, až bude tlačítko přítomné a povolené ke kliknutí (až doběhne předchozí render)
+            const btn = await waitForButtonReady(12000);
             if (stopRequested) break;
 
-            currentLoadedBatches++;
-            const total = getTotalCatalogCount();
-            const totalStr = total ? ` (${after} / ${total.toLocaleString('cs-CZ')})` : ` (${after} produktů)`;
-            loadStatus.textContent = `Načítání: ${currentLoadedBatches} / ${targetLabel}${totalStr}`;
-
-            if (after === before) {
-                reachedEnd = true;
-                break;
+            if (!btn) {
+                if (isCatalogFullyLoaded()) {
+                    reachedEnd = true;
+                    break;
+                }
+                consecutiveRetries++;
+                if (consecutiveRetries >= 3) break;
+                await new Promise(r => setTimeout(r, 800));
+                continue;
             }
 
-            // Krátká pauza pro plynulost vykreslování v prohlížeči
-            await new Promise(r => setTimeout(r, 120));
+            const before = getProductCards().length;
+            btn.click();
+
+            // 3. Počkáme, až se objeví nové produkty v DOMu
+            const after = await waitForMoreProducts(before, 15000);
+            if (stopRequested) break;
+
+            if (after > before) {
+                consecutiveRetries = 0;
+                currentLoadedBatches++;
+                const total = getTotalCatalogCount();
+                const totalStr = total ? ` (${after} / ${total.toLocaleString('cs-CZ')})` : ` (${after} produktů)`;
+                loadStatus.textContent = `Načítání: ${currentLoadedBatches} / ${targetLabel}${totalStr}`;
+            } else {
+                if (isCatalogFullyLoaded()) {
+                    reachedEnd = true;
+                    break;
+                }
+                consecutiveRetries++;
+                if (consecutiveRetries >= 3) break;
+                await new Promise(r => setTimeout(r, 800));
+                continue;
+            }
+
+            // Krátká pauza pro plynulost v prohlížeči
+            await new Promise(r => setTimeout(r, 200));
         }
 
         isMultiLoading = false;
@@ -1111,12 +1230,14 @@
 
         if (stopRequested) {
             loadStatus.textContent = `⏹ Zastaveno po ${currentLoadedBatches} dávkách`;
-        } else if (reachedEnd) {
+        } else if (reachedEnd || isCatalogFullyLoaded()) {
             loadStatus.textContent = `✓ Načteno ${currentLoadedBatches} dávek (konec katalogu)`;
+        } else if (consecutiveRetries >= 3) {
+            loadStatus.textContent = `⚠ Načteno ${currentLoadedBatches} dávek (zkuste pokračovat dalším kliknutím)`;
         } else {
             loadStatus.textContent = `✓ Načteno ${currentLoadedBatches} dávek`;
         }
-        setTimeout(() => { loadStatus.textContent = ''; }, 3500);
+        setTimeout(() => { loadStatus.textContent = ''; }, 4500);
 
         applyFilter();
         applySort();
@@ -1257,7 +1378,7 @@
 
     // Tlačítka načítání
     loadOneBtn.addEventListener('click', () => {
-        clickLoadMore();
+        loadOneBatch();
     });
     loadManyBtn.addEventListener('click', runMultiLoad);
     stopBtn.addEventListener('click', () => {
@@ -1295,12 +1416,21 @@
         const isTyping = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
             || document.activeElement?.isContentEditable;
         if (e.key === 'Control' && !isTyping && !e.shiftKey && !e.altKey && !e.metaKey) {
-            clickLoadMore();
+            loadOneBatch();
         }
     });
 
     // ─── Inicializace ──────────────────────────────────────────────────────────
     function init() {
+        if (!document.body) {
+            setTimeout(init, 50);
+            return;
+        }
+        if (!document.getElementById('lf-panel')) {
+            (document.head || document.documentElement).appendChild(style);
+            document.body.appendChild(bubble);
+            document.body.appendChild(panel);
+        }
         loadSavedState();
         updateFilterToggle();
         updateScrollUI();
@@ -1314,9 +1444,9 @@
 
     // Spuštění po načtení stránky a pojistka pro Single Page Application (Nuxt)
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => setTimeout(init, 300));
+        document.addEventListener('DOMContentLoaded', () => setTimeout(init, 100));
     } else {
-        setTimeout(init, 300);
+        setTimeout(init, 100);
     }
 
 })();
