@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Lidl Product Filter
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.3.2
 // @description  Filtrování produktů na Lidl.cz podle textu, slevy a přítomnosti akumulátoru (bez baterie / se sadou), efektivní dávkové přednačítání a řazení
 // @author       Filip J. & Tomi
 // @match        https://www.lidl.cz/*
@@ -51,7 +51,8 @@
             if (typeof window !== 'undefined' && window.IntersectionObserver) {
                 const NativeIntersectionObserver = window.IntersectionObserver;
                 window.IntersectionObserver = function (callback, options) {
-                    const isBatchObserver = options?.rootMargin === '1040px 0px 1040px 0px';
+                    const rootMarginStr = options?.rootMargin ? String(options.rootMargin) : '';
+                    const isBatchObserver = rootMarginStr.includes('1040px');
                     const wrappedCallback = (entries, observer) => {
                         for (let i = 0; i < entries.length; i++) {
                             const entry = entries[i];
@@ -87,19 +88,41 @@
         } catch (e) {}
     })();`;
 
-    // Aplikace v aktuálním kontextu
+    // 1. Spuštění v kontextu userscriptu
     try { eval(patchCode); } catch (e) {}
 
-    // Injekce přímo do DOMu pro běh v hlavním okně (Main World)
-    try {
+    // 2. Injekce přímo do DOMu pro běh v hlavním okně (Main World)
+    function injectPatch() {
+        const target = document.head || document.documentElement;
+        if (!target) return false;
+        if (document.getElementById('lf-patch-script')) return true;
+
         const s = document.createElement('script');
+        s.id = 'lf-patch-script';
         s.textContent = patchCode;
-        (document.head || document.documentElement).appendChild(s);
-        s.remove();
-    } catch (e) {}
+        try {
+            target.appendChild(s);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    if (!injectPatch()) {
+        const obs = new MutationObserver(() => {
+            if (injectPatch()) obs.disconnect();
+        });
+        try {
+            obs.observe(document, { childList: true, subtree: true });
+        } catch (e) {}
+        if (document.readyState === 'loading') {
+            document.addEventListener('readystatechange', injectPatch, { once: true });
+            document.addEventListener('DOMContentLoaded', injectPatch, { once: true });
+        }
+    }
 
     // ─── Konstanty & Úložiště ──────────────────────────────────────────────────
-    const CURRENT_VERSION = '1.3.1';
+    const CURRENT_VERSION = '1.3.2';
     const RAW_URL = 'https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js';
 
     const STORAGE = {
@@ -684,13 +707,27 @@
     // Pro správné fungování CSS Gridu a odolnost vůči hydrataci Vue/Nuxt musíme skrývat
     // a řadit přímo tyto rodičovské <li> elementy, nikoli jen jejich vnitřní elementy.
     function getProductCards() {
-        const gridContainers = document.querySelectorAll(SELECTORS.gridContainer);
         const cards = [];
         const seen = new Set();
 
-        if (gridContainers.length > 0) {
+        const batches = document.querySelectorAll('.s-product-batch');
+        if (batches.length > 0) {
+            batches.forEach(batch => {
+                const lis = batch.querySelectorAll('li[id^="grid-item-"], ol > li, ul > li, :scope > li, [data-testselector="s-product-grid__list-item"], .product-grid-box');
+                lis.forEach(li => {
+                    const card = li.closest('li[id^="grid-item-"]') || li.closest('li') || li;
+                    if (!seen.has(card)) {
+                        seen.add(card);
+                        cards.push(card);
+                    }
+                });
+            });
+        }
+
+        if (cards.length === 0) {
+            const gridContainers = document.querySelectorAll(SELECTORS.gridContainer);
             gridContainers.forEach(grid => {
-                const lis = Array.from(grid.querySelectorAll('li[id^="grid-item-"], .s-product-batch > li, :scope > li, [data-testselector="s-product-grid__list-item"], .product-grid-box'));
+                const lis = grid.querySelectorAll('li[id^="grid-item-"], .s-product-batch > li, :scope > li, [data-testselector="s-product-grid__list-item"], .product-grid-box');
                 lis.forEach(li => {
                     const card = li.closest('li[id^="grid-item-"]') || li.closest('li') || li;
                     if (!seen.has(card)) {
@@ -917,7 +954,13 @@
 
     // ─── Filtrační logika ──────────────────────────────────────────────────────
     function applyFilter() {
-        const cards = getProductCards();
+        let cards = getProductCards();
+        const fetchedTotal = getPagingFetchedCount();
+        if (fetchedTotal && cards.length < fetchedTotal) {
+            window.dispatchEvent(new Event('resize'));
+            window.dispatchEvent(new Event('scroll'));
+            cards = getProductCards();
+        }
         const total = cards.length;
 
         if (!filteringEnabled) {
@@ -985,35 +1028,56 @@
         updateCount(shown, total);
     }
 
+    function getPagingInfo() {
+        const lmText = document.querySelector(SELECTORS.loadMoreText);
+        if (lmText && lmText.textContent) {
+            const m = lmText.textContent.match(/([\d\s]+)\s*(?:\/|z)\s*([\d\s]+)/i);
+            if (m) {
+                const current = parseInt(m[1].replace(/[^\d]/g, ''), 10);
+                const total = parseInt(m[2].replace(/[^\d]/g, ''), 10);
+                if (Number.isFinite(current) && Number.isFinite(total) && total > 0) {
+                    return { current, total };
+                }
+            }
+        }
+        return { current: null, total: null };
+    }
+
     function getTotalCatalogCount() {
-        // Zkusí najít celkový počet z hlavičky (např. "3670 produktů")
+        const paging = getPagingInfo();
+        if (paging.total) return paging.total;
+
+        // Fallback: zkusí najít celkový počet z hlavičky (např. "3670 produktů")
         const label = document.querySelector(SELECTORS.productsCount);
         if (label) {
             const num = parseInt(label.textContent.replace(/[^\d]/g, ''), 10);
             if (Number.isFinite(num) && num > 0) return num;
         }
-        // Nebo z textu načítání "48 / 3670 produktů"
-        const lmText = document.querySelector(SELECTORS.loadMoreText);
-        if (lmText) {
-            const parts = lmText.textContent.match(/\/\s*([\d\s]+)/);
-            if (parts) {
-                const num = parseInt(parts[1].replace(/[^\d]/g, ''), 10);
-                if (Number.isFinite(num) && num > 0) return num;
-            }
-        }
         return null;
+    }
+
+    function getPagingFetchedCount() {
+        return getPagingInfo().current;
+    }
+
+    function getBatchCount() {
+        return document.querySelectorAll('.s-product-batch').length;
     }
 
     function updateCount(shown, total) {
         const catalogTotal = getTotalCatalogCount();
-        const catalogStr = catalogTotal && catalogTotal > total ? ` (z celkem ${catalogTotal.toLocaleString('cs-CZ')})` : '';
+        const fetchedTotal = getPagingFetchedCount();
+        const effectiveTotal = Math.max(total, fetchedTotal || 0);
+        const catalogStr = catalogTotal && catalogTotal > effectiveTotal
+            ? ` (z celkem ${catalogTotal.toLocaleString('cs-CZ')})`
+            : (catalogTotal && effectiveTotal >= catalogTotal ? ` (vše načteno)` : '');
 
         if (!filteringEnabled || shown === null) {
-            countEl.textContent = total > 0 ? `Načteno ${total} produktů${catalogStr}` : '';
+            countEl.textContent = effectiveTotal > 0 ? `Načteno ${effectiveTotal.toLocaleString('cs-CZ')} produktů${catalogStr}` : '';
             countEl.className = '';
             return;
         }
-        countEl.textContent = `Zobrazeno ${shown} z ${total} načtených${catalogStr}`;
+        countEl.textContent = `Zobrazeno ${shown.toLocaleString('cs-CZ')} z ${effectiveTotal.toLocaleString('cs-CZ')} načtených${catalogStr}`;
         countEl.className = shown === 0 ? 'no-results' : 'has-results';
     }
 
@@ -1108,12 +1172,16 @@
 
     function isCatalogFullyLoaded() {
         const total = getTotalCatalogCount();
-        const current = getProductCards().length;
-        if (total && total > 0 && current >= total) {
-            return true;
+        const fetched = getPagingFetchedCount();
+        const currentCards = getProductCards().length;
+
+        if (total && total > 0) {
+            if (fetched && fetched >= total) return true;
+            if (currentCards >= total) return true;
         }
+
         const lmText = document.querySelector(SELECTORS.loadMoreText);
-        if (lmText) {
+        if (lmText && lmText.textContent) {
             const m = lmText.textContent.match(/(\d+)\s*\/\s*(\d+)/);
             if (m) {
                 const cur = parseInt(m[1].replace(/\s+/g, ''), 10);
@@ -1138,7 +1206,7 @@
                     return btn;
                 }
             }
-            await new Promise(r => setTimeout(r, 100));
+            await new Promise(r => setTimeout(r, 120));
         }
         return null;
     }
@@ -1146,17 +1214,41 @@
     async function loadOneBatch() {
         const btn = await waitForButtonReady(4000);
         if (btn) {
+            const beforeCards = getProductCards().length;
+            const beforeBatches = getBatchCount();
+            const beforeFetched = getPagingFetchedCount() || 0;
             btn.click();
+            await waitForMoreProducts(beforeCards, beforeBatches, beforeFetched, 8000);
+            applyFilter();
+            applySort();
+            updateBubble();
             return true;
         }
         return false;
     }
 
-    // Čeká na přidání nových produktů do DOMu
-    function waitForMoreProducts(previousCount, maxWaitMs = 15000) {
+    // Čeká na přidání nových produktů do DOMu nebo aktualizaci stránkování
+    function waitForMoreProducts(prevCards, prevBatches, prevFetched, maxWaitMs = 15000) {
         return new Promise(resolve => {
-            const countNow = () => getProductCards().length;
-            if (countNow() > previousCount) return resolve(countNow());
+            const checkProgress = () => {
+                const currentCards = getProductCards().length;
+                const currentBatches = getBatchCount();
+                const currentFetched = getPagingFetchedCount() || 0;
+
+                const progressed = currentCards > prevCards
+                    || currentBatches > prevBatches
+                    || currentFetched > prevFetched;
+
+                return {
+                    cards: currentCards,
+                    batches: currentBatches,
+                    fetched: currentFetched,
+                    progress: progressed
+                };
+            };
+
+            const initial = checkProgress();
+            if (initial.progress) return resolve(initial);
 
             let done = false;
             let observer = null;
@@ -1169,16 +1261,18 @@
                 if (observer) observer.disconnect();
                 if (interval) clearInterval(interval);
                 if (timer) clearTimeout(timer);
-                resolve(countNow());
+                resolve(checkProgress());
             };
 
             observer = new MutationObserver(() => {
-                if (countNow() > previousCount) finish();
+                const state = checkProgress();
+                if (state.progress) finish();
             });
-            observer.observe(document.body, { childList: true, subtree: true });
+            observer.observe(document.body, { childList: true, subtree: true, characterData: true });
 
             interval = setInterval(() => {
-                if (countNow() > previousCount) finish();
+                const state = checkProgress();
+                if (state.progress) finish();
             }, 150);
 
             timer = setTimeout(finish, maxWaitMs);
@@ -1224,18 +1318,22 @@
                 continue;
             }
 
-            const before = getProductCards().length;
+            const beforeCards = getProductCards().length;
+            const beforeBatches = getBatchCount();
+            const beforeFetched = getPagingFetchedCount() || 0;
+
             btn.click();
 
-            // 3. Počkáme, až se objeví nové produkty v DOMu
-            const after = await waitForMoreProducts(before, 15000);
+            // 3. Počkáme, až se objeví nové produkty v DOMu nebo se aktualizuje stránkování
+            const result = await waitForMoreProducts(beforeCards, beforeBatches, beforeFetched, 15000);
             if (stopRequested) break;
 
-            if (after > before) {
+            if (result.progress || result.cards > beforeCards || result.batches > beforeBatches || (result.fetched && result.fetched > beforeFetched)) {
                 consecutiveRetries = 0;
                 currentLoadedBatches++;
                 const total = getTotalCatalogCount();
-                const totalStr = total ? ` (${after} / ${total.toLocaleString('cs-CZ')})` : ` (${after} produktů)`;
+                const currentCount = Math.max(result.fetched || 0, result.cards || 0);
+                const totalStr = total ? ` (${currentCount.toLocaleString('cs-CZ')} / ${total.toLocaleString('cs-CZ')})` : ` (${currentCount} produktů)`;
                 loadStatus.textContent = `Načítání: ${currentLoadedBatches} / ${targetLabel}${totalStr}`;
             } else {
                 if (isCatalogFullyLoaded()) {
@@ -1260,13 +1358,17 @@
         if (stopRequested) {
             loadStatus.textContent = `⏹ Zastaveno po ${currentLoadedBatches} dávkách`;
         } else if (reachedEnd || isCatalogFullyLoaded()) {
-            loadStatus.textContent = `✓ Načteno ${currentLoadedBatches} dávek (konec katalogu)`;
+            loadStatus.textContent = `✓ Načteno vše (konec katalogu)`;
         } else if (consecutiveRetries >= 3) {
             loadStatus.textContent = `⚠ Načteno ${currentLoadedBatches} dávek (zkuste pokračovat dalším kliknutím)`;
         } else {
             loadStatus.textContent = `✓ Načteno ${currentLoadedBatches} dávek`;
         }
         setTimeout(() => { loadStatus.textContent = ''; }, 4500);
+
+        // Vyvoláme resize a scroll událost, aby se ujistilo, že všechny dávky jsou namountované
+        window.dispatchEvent(new Event('resize'));
+        window.dispatchEvent(new Event('scroll'));
 
         applyFilter();
         applySort();
