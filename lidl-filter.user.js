@@ -1,15 +1,15 @@
 // ==UserScript==
 // @name         Lidl Product Filter
 // @namespace    http://tampermonkey.net/
-// @version      1.3.0
+// @version      1.3.1
 // @description  Filtrování produktů na Lidl.cz podle textu, slevy a přítomnosti akumulátoru (bez baterie / se sadou), efektivní dávkové přednačítání a řazení
 // @author       Filip J. & Tomi
 // @match        https://www.lidl.cz/*
 // @match        https://www.lidl.sk/*
 // @run-at       document-start
+// @grant        none
 // @updateURL    https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js
 // @downloadURL  https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js
-// @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
 (function () {
@@ -17,60 +17,89 @@
 
     // ─── Prevence unmountování dávek Lidlem ────────────────────────────────────
     // Lidl ve Vue komponentě SNBBatchRenderComponent používá IntersectionObserver s rootMargin "1040px 0px 1040px 0px".
-    // Když se dávka odroluje nahoru, Lidl ji kompletně odmountuje z DOMu (nahradí prázdným komentářem <!---->).
-    // Tím přijdeme o načtené produkty pro textové filtrování a getProductCards().length přestane růst,
-    // což způsobovalo předčasné zastavení načítání.
-    // Zachycením IntersectionObserveru zajistíme, že isIntersecting je pro dávky vždy true,
-    // takže produkty zůstávají trvale v DOMu a lze v nich kdykoliv bleskově hledat.
-    // Pro plynulost renderingu se o hardwarovou akceleraci stará CSS content-visibility: auto.
-    function patchIntersectionObserver(targetWin) {
-        if (!targetWin || !targetWin.IntersectionObserver) return;
-        if (targetWin.__lf_io_patched) return;
-        targetWin.__lf_io_patched = true;
+    // Když se dávka odroluje nahoru, Vue komponenta ji kompletně odmountuje z DOMu (nahradí prázdným komentářem <!---->).
+    // Tím v DOMu zůstávalo vždy jen cca 20 dávek (~1008 produktů) a zbytek katalogu nebyl v DOMu dostupný.
+    // Aby zůstaly v DOMu VŠECHNY produkty pro textové i slevové filtrování a vyhledávání:
+    // 1. Injektujeme kód přímo do hlavního JavaScript kontextu stránky (Main World) pomocí <script> elementu.
+    // 2. Přepíšeme IntersectionObserverEntry.prototype.isIntersecting getter, aby pro .s-product-batch vracel vždy true.
+    // 3. Obalíme window.IntersectionObserver konstruktor pro zaručení isIntersecting: true.
+    // 4. O plynulost renderingu 3000+ prvků se stará CSS content-visibility: auto (HW akcelerace jádrem prohlížeče).
 
-        const NativeIntersectionObserver = targetWin.IntersectionObserver;
-        targetWin.IntersectionObserver = function (callback, options) {
-            const isBatchObserver = options?.rootMargin === '1040px 0px 1040px 0px';
-            const wrappedCallback = (entries, observer) => {
-                for (let i = 0; i < entries.length; i++) {
-                    const entry = entries[i];
-                    const target = entry.target;
-                    const isBatch = isBatchObserver ||
-                        (target && (target.classList?.contains('s-product-batch') || target.matches?.('.s-product-batch')));
-                    if (isBatch) {
-                        try {
-                            Object.defineProperty(entry, 'isIntersecting', {
-                                value: true,
-                                writable: true,
-                                configurable: true
-                            });
-                        } catch (e) {
-                            try {
-                                entries[i] = new Proxy(entry, {
-                                    get(t, p, r) {
-                                        if (p === 'isIntersecting') return true;
-                                        const v = Reflect.get(t, p, r);
-                                        return typeof v === 'function' ? v.bind(t) : v;
-                                    }
-                                });
-                            } catch (e2) {}
+    const patchCode = `(function() {
+        if (window.__lf_io_patched) return;
+        window.__lf_io_patched = true;
+
+        try {
+            if (typeof IntersectionObserverEntry !== 'undefined' && IntersectionObserverEntry.prototype) {
+                const desc = Object.getOwnPropertyDescriptor(IntersectionObserverEntry.prototype, 'isIntersecting');
+                const orig = desc ? desc.get : null;
+                Object.defineProperty(IntersectionObserverEntry.prototype, 'isIntersecting', {
+                    get() {
+                        const t = this.target;
+                        if (t && (t.classList?.contains('s-product-batch') || t.matches?.('.s-product-batch') || t.closest?.('.s-product-batch'))) {
+                            return true;
                         }
-                    }
-                }
-                return callback(entries, observer);
-            };
-            return new NativeIntersectionObserver(wrappedCallback, options);
-        };
-        targetWin.IntersectionObserver.prototype = NativeIntersectionObserver.prototype;
-    }
+                        return orig ? orig.call(this) : true;
+                    },
+                    configurable: true,
+                    enumerable: true
+                });
+            }
+        } catch (e) {}
 
-    patchIntersectionObserver(window);
-    if (typeof unsafeWindow !== 'undefined' && unsafeWindow !== window) {
-        patchIntersectionObserver(unsafeWindow);
-    }
+        try {
+            if (typeof window !== 'undefined' && window.IntersectionObserver) {
+                const NativeIntersectionObserver = window.IntersectionObserver;
+                window.IntersectionObserver = function (callback, options) {
+                    const isBatchObserver = options?.rootMargin === '1040px 0px 1040px 0px';
+                    const wrappedCallback = (entries, observer) => {
+                        for (let i = 0; i < entries.length; i++) {
+                            const entry = entries[i];
+                            const target = entry.target;
+                            const isBatch = isBatchObserver ||
+                                (target && (target.classList?.contains('s-product-batch') || target.matches?.('.s-product-batch') || target.closest?.('.s-product-batch')));
+                            if (isBatch) {
+                                try {
+                                    Object.defineProperty(entry, 'isIntersecting', {
+                                        value: true,
+                                        writable: true,
+                                        configurable: true
+                                    });
+                                } catch (e) {
+                                    try {
+                                        entries[i] = new Proxy(entry, {
+                                            get(t, p, r) {
+                                                if (p === 'isIntersecting') return true;
+                                                const v = Reflect.get(t, p, r);
+                                                return typeof v === 'function' ? v.bind(t) : v;
+                                            }
+                                        });
+                                    } catch (e2) {}
+                                }
+                            }
+                        }
+                        return callback(entries, observer);
+                    };
+                    return new NativeIntersectionObserver(wrappedCallback, options);
+                };
+                window.IntersectionObserver.prototype = NativeIntersectionObserver.prototype;
+            }
+        } catch (e) {}
+    })();`;
+
+    // Aplikace v aktuálním kontextu
+    try { eval(patchCode); } catch (e) {}
+
+    // Injekce přímo do DOMu pro běh v hlavním okně (Main World)
+    try {
+        const s = document.createElement('script');
+        s.textContent = patchCode;
+        (document.head || document.documentElement).appendChild(s);
+        s.remove();
+    } catch (e) {}
 
     // ─── Konstanty & Úložiště ──────────────────────────────────────────────────
-    const CURRENT_VERSION = '1.3.0';
+    const CURRENT_VERSION = '1.3.1';
     const RAW_URL = 'https://raw.githubusercontent.com/RouSkiSroup/ldlFilter/main/lidl-filter.user.js';
 
     const STORAGE = {
@@ -1259,30 +1288,40 @@
     }
 
     function checkForUpdate() {
-        if (typeof GM_xmlhttpRequest === 'undefined') return;
-        GM_xmlhttpRequest({
-            method: 'GET',
-            url: RAW_URL + '?t=' + Date.now(),
-            onload(resp) {
-                if (resp.status !== 200) return;
-                const match = resp.responseText.match(/@version\s+([\d.]+)/);
-                if (!match) return;
-                const latest = match[1];
-                if (!isNewerVersion(latest, CURRENT_VERSION)) return;
-                const banner = document.getElementById('lf-update-banner');
-                if (!banner) return;
-                banner.textContent = `⬆ Nová verze v${latest} k dispozici — klikněte pro aktualizaci`;
-                banner.style.display = 'block';
-                banner.addEventListener('click', () => {
-                    window.open(RAW_URL, '_blank', 'noopener');
-                    setTimeout(() => {
-                        banner.textContent = '↻ Obnovte stránku pro aktivaci nové verze';
-                        banner.classList.add('applied');
-                    }, 500);
-                });
-            },
-            onerror() {},
-        });
+        const url = RAW_URL + '?t=' + Date.now();
+        const handleResp = text => {
+            const match = text.match(/@version\s+([\d.]+)/);
+            if (!match) return;
+            const latest = match[1];
+            if (!isNewerVersion(latest, CURRENT_VERSION)) return;
+            const banner = document.getElementById('lf-update-banner');
+            if (!banner) return;
+            banner.textContent = `⬆ Nová verze v${latest} k dispozici — klikněte pro aktualizaci`;
+            banner.style.display = 'block';
+            banner.addEventListener('click', () => {
+                window.open(RAW_URL, '_blank', 'noopener');
+                setTimeout(() => {
+                    banner.textContent = '↻ Obnovte stránku pro aktivaci nové verze';
+                    banner.classList.add('applied');
+                }, 500);
+            });
+        };
+
+        if (typeof GM_xmlhttpRequest !== 'undefined') {
+            GM_xmlhttpRequest({
+                method: 'GET',
+                url: url,
+                onload(resp) {
+                    if (resp.status === 200) handleResp(resp.responseText);
+                },
+                onerror() {},
+            });
+        } else if (typeof fetch !== 'undefined') {
+            fetch(url)
+                .then(r => r.ok ? r.text() : '')
+                .then(text => { if (text) handleResp(text); })
+                .catch(() => {});
+        }
     }
 
     // ─── MutationObserver pro dynamické produkty a hydrataci ──────────────────
